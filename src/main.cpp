@@ -32,6 +32,22 @@ extern "C" { //Needed for VESC libraries since they're compiled as C++ but writt
 #define kSC_WIRE_ADDR 0x01
 #define kHMI_WIRE_ADDR 0x02
 
+//Geometry and conversions
+#define kFINAL_DRIVE_REDUCTION 1.5 //gear ratio
+#define kDRIVE_WHEEL_CIRCUMFERENCE 23.25 //inches
+#define kACCELERATION_MPH_PER_SECOND 3.25 //mph/s
+#define kOUTPUT_POLARITY 1 //-1 to invert output, 1 for normal output, 0 to disable output (VESC)
+
+double convertERPMtoMPH(int32_t erpm) {
+    return (erpm * kFINAL_DRIVE_REDUCTION * kDRIVE_WHEEL_CIRCUMFERENCE * 60.0) / 4435200.0;
+}
+
+int convertMPHtoERPM(double mph) {
+    return (int) ((mph * 4435200.0) / (kFINAL_DRIVE_REDUCTION * kDRIVE_WHEEL_CIRCUMFERENCE * 60.0));
+}
+
+int kVELOCITY_DV_ERPM = (int) (convertMPHtoERPM(kACCELERATION_MPH_PER_SECOND) / (1000.0 / kVESC_WRITE_RATE_MS));
+
 
 //Runtime values
 unsigned long ct = 0; //Current time
@@ -40,7 +56,11 @@ float cVESC_inputVoltage = 0.0f;
 float cVESC_currentDrawAmps = 0.0f;
 float cVESC_ERPM = 0.0f;
 
+int cHMI_speedSetpointERPM = 0;
+
 bool cSC_estopActive = false;
+
+int c_activeSpeedTargetERPM = 0;
 
 //Runtime functions
 /**
@@ -83,6 +103,43 @@ void SC_update() {
     cSC_estopActive = byteIn != 0b00000000;
 }
 
+/**
+ * Updates the velocity target to be sent to the VESC based on the current setpoint and the acceleration parameter
+ */
+void updateSpeed() {
+    if (cHMI_speedSetpointERPM > c_activeSpeedTargetERPM) {
+        //Setpoint is faster than current target, speed up
+        c_activeSpeedTargetERPM += kVELOCITY_DV_ERPM;
+        if (c_activeSpeedTargetERPM > cHMI_speedSetpointERPM) {
+            //This add put us over the setpoint, set the current target equal to the setpoint
+            c_activeSpeedTargetERPM = cHMI_speedSetpointERPM;
+        }
+    } else if (cHMI_speedSetpointERPM < c_activeSpeedTargetERPM) {
+        //Setpoint is slower than current target, slow down
+        c_activeSpeedTargetERPM -= kVELOCITY_DV_ERPM;
+        if (c_activeSpeedTargetERPM < cHMI_speedSetpointERPM) {
+            //This subtract put us under the setpoint, set the current target equal to the setpoint
+            c_activeSpeedTargetERPM = cHMI_speedSetpointERPM;
+        }
+    }
+}
+
+/**
+ * Resets the target speed to zero immediately and resets the setpoint to zero.  This gets called when an e-stop
+ * occurs.
+ */
+void stopAndResetSpeed() {
+    c_activeSpeedTargetERPM = 0;
+    cHMI_speedSetpointERPM = 0;
+}
+
+/**
+ * Sends a command to the VESC based on the current state.
+ */
+void VESC_write() {
+    bldc_interface_set_rpm(kOUTPUT_POLARITY * c_activeSpeedTargetERPM);
+}
+
 void setup() {
     //Serial is the UART connected to the USB port, Serial1 is the UART connected to the pins on the board.
     //Serial will be used for debug output, Serial1 will be used to communicate with the VESC
@@ -111,6 +168,8 @@ void loop() {
     //Begin phased loop code here
     if (ct - tLastVESC_write >= kVESC_WRITE_RATE_MS) {
         //VESC Write
+        updateSpeed(); //TODO handle estop here
+        VESC_write();
         tLastVESC_write = ct;
     }
 
