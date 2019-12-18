@@ -3,4 +3,6 @@
 .piolibdeps
 CMakeListsPrivate.txt
 
+.idea/
+cmake-build-debug/
 cmake-build-adafruit_feather_m4/
