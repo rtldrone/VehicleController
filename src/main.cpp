@@ -4,6 +4,7 @@ extern "C" { //Needed for VESC libraries since they're compiled as C++ but writt
 #include <bldc_interface_uart.h>
 #include <datatypes.h>
 #include <bldc_interface.h>
+#include <buffer.h>
 }
 
 #include <Wire.h>
@@ -29,14 +30,18 @@ extern "C" { //Needed for VESC libraries since they're compiled as C++ but writt
 #define kSC_UPDATE_RATE_MS 100
 
 //Addresses
-#define kSC_WIRE_ADDR 0x01
-#define kHMI_WIRE_ADDR 0x02
+#define kSC_WIRE_ADDR 21
+#define kHMI_WIRE_ADDR 22
 
 //Geometry and conversions
 #define kFINAL_DRIVE_REDUCTION 1.5 //gear ratio
 #define kDRIVE_WHEEL_CIRCUMFERENCE 23.25 //inches
 #define kACCELERATION_MPH_PER_SECOND 3.25 //mph/s
 #define kOUTPUT_POLARITY 1 //-1 to invert output, 1 for normal output, 0 to disable output (VESC)
+
+//Communication constnats
+#define kHMI_REQ_SIZE 4 //how many bytes the HMI controller will send us (4 as of 12/18/2019)
+#define kHMI_REP_SIZE 22 //how many bytes we send the HMI controller (22 as of 12/18/2019)
 
 double convertERPMtoMPH(int32_t erpm) {
     return (erpm * kFINAL_DRIVE_REDUCTION * kDRIVE_WHEEL_CIRCUMFERENCE * 60.0) / 4435200.0;
@@ -61,6 +66,9 @@ int cHMI_speedSetpointERPM = 0;
 bool cSC_estopActive = false;
 
 int c_activeSpeedTargetERPM = 0;
+
+uint8_t cHMI_readBuffer[kHMI_REQ_SIZE];
+uint8_t cHMI_writeBuffer[kHMI_REP_SIZE];
 
 //Runtime functions
 /**
@@ -101,6 +109,54 @@ void SC_update() {
     Wire.requestFrom(kSC_WIRE_ADDR, 1); //This clears the Wire RX buffer for us so no need to worry about other data in the buffer.
     auto byteIn = Wire.read();
     cSC_estopActive = byteIn != 0b00000000;
+}
+
+/**
+ * Requests an update from the HMI controller, and sends the HMI controller current state information
+ */
+void HMI_update() {
+    Wire.requestFrom(kHMI_WIRE_ADDR, kHMI_REQ_SIZE); //Request from the HMI
+    Wire.readBytes(cHMI_readBuffer, kHMI_REQ_SIZE); //Read the data from the HMI
+
+    int32_t i = 0; //Buffer index, automatically incremented by buffer read and append calls
+
+    //Read data from buffer
+    //float32 speed_setpoint (MPH)
+    //TODAL - 32 bits (4 bytes)
+    //Note that there is only one float currently, but we use a buffer here to make it easy to add more data later
+    float speedSetpointMph = buffer_get_float32_auto(cHMI_readBuffer, &i);
+
+    //Set current values
+    cHMI_speedSetpointERPM = convertMPHtoERPM(speedSetpointMph);
+
+    //Convert values for sending
+    auto speedMph = (float) convertERPMtoMPH(cVESC_ERPM);
+    auto speedTargetMph = (float) convertERPMtoMPH(c_activeSpeedTargetERPM);
+
+    i = 0; //Reset buffer index for writing
+
+    //Write data to out buffer
+    //float32 battery_voltage
+    //uint8 battery_state
+    //float32 current_draw
+    //float32 speed (MPH)
+    //float32 speed_target (MPH)
+    //int8 estop_state
+    //int32 fault_code
+    //TOTAL - 176 bits (22 bytes)
+    buffer_append_float32_auto(cHMI_writeBuffer, cVESC_inputVoltage, &i);
+    buffer_append_uint8(cHMI_writeBuffer, 0, &i); //TODO battery state
+    buffer_append_float32_auto(cHMI_writeBuffer, cVESC_currentDrawAmps, &i);
+    buffer_append_float32_auto(cHMI_writeBuffer, speedMph, &i);
+    buffer_append_float32_auto(cHMI_writeBuffer, speedTargetMph, &i);
+    buffer_append_uint8(cHMI_writeBuffer, cSC_estopActive, &i);
+    buffer_append_int32(cHMI_writeBuffer, 0, &i); //TODO fault code
+
+
+    //Write buffer out to wire
+    Wire.beginTransmission(kHMI_WIRE_ADDR);
+    Wire.write(cHMI_writeBuffer, kHMI_REP_SIZE);
+    Wire.endTransmission();
 }
 
 /**
@@ -168,7 +224,10 @@ void loop() {
     //Begin phased loop code here
     if (ct - tLastVESC_write >= kVESC_WRITE_RATE_MS) {
         //VESC Write
-        updateSpeed(); //TODO handle estop here
+        updateSpeed();
+        if (cSC_estopActive) {
+            stopAndResetSpeed(); //Reset the speed if the e-stop is active
+        }
         VESC_write();
         tLastVESC_write = ct;
     }
@@ -181,7 +240,7 @@ void loop() {
 
     if (ct - tLastHMI_update >= kHMI_UPDATE_RATE_MS) {
         //HMI Update
-
+        HMI_update();
         tLastHMI_update = ct;
     }
 
@@ -196,9 +255,8 @@ void loop() {
     bldc_interface_uart_run_timer(); //Updates the VESC library timer
     //End phased loop code here
 
-    auto end = micros(); //Capture the end time
     //Phase the loop so it runs at the desired rate
-    long elapsedMicros = end - start;
+    long elapsedMicros = micros() - start;
     long remainingTime = kLOOP_RATE_MICROS - elapsedMicros; //The time we need to delay for to hit the loop phase
     if (remainingTime > 0) delayMicroseconds(remainingTime);
 
