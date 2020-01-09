@@ -8,6 +8,7 @@ extern "C" { //Needed for VESC libraries since they're compiled as C++ but writt
 }
 
 #include <Wire.h>
+#include <wiring_private.h>
 
 /**
  * This code uses the following global naming prefix conventions:
@@ -22,6 +23,7 @@ extern "C" { //Needed for VESC libraries since they're compiled as C++ but writt
 //Constants
 #define kLOOP_RATE_MICROS 1000 //Rate the loop should run at
 #define kVESC_BAUDRATE 115200 //The baudrate configured in the VESC
+#define kHMI_BAUDRATE 921600
 
 //Rate parameters
 #define kVESC_WRITE_RATE_MS 10
@@ -39,36 +41,102 @@ extern "C" { //Needed for VESC libraries since they're compiled as C++ but writt
 #define kACCELERATION_MPH_PER_SECOND 3.25 //mph/s
 #define kOUTPUT_POLARITY 1 //-1 to invert output, 1 for normal output, 0 to disable output (VESC)
 
-//Communication constnats
+//Battery thresholds.  The battery will be defined as OK if the voltage is above the threshold,
+//with the same logic for warn and bad states.
+#define BATTERY_OK_THRESHOLD_VOLTS 24.0f
+#define BATTERY_WARN_THRESHOLD_VOLTS 20.0f
+
+//Communication constants
 #define kHMI_REQ_SIZE 4 //how many bytes the HMI controller will send us (4 as of 12/18/2019)
 #define kHMI_REP_SIZE 22 //how many bytes we send the HMI controller (22 as of 12/18/2019)
 
+//Serial definition for communicating with the HMI controller.  The following code is just to change one of the Atmel
+//"sercom" buses on the processor to be registered as Serial2.  Then we need to bind the Atmel interrupts to Arduino.
+#define PIN_SERIAL2_RX 15  // PA05
+#define PAD_SERIAL2_RX (SERCOM_RX_PAD_1)
+#define PIN_SERIAL2_TX 18  // PA04
+#define PAD_SERIAL2_TX (UART_TX_PAD_0)
+Uart Serial2( &sercom0, PIN_SERIAL2_RX, PIN_SERIAL2_TX, PAD_SERIAL2_RX, PAD_SERIAL2_TX );
+void SERCOM0_0_Handler() { Serial2.IrqHandler(); }
+void SERCOM0_1_Handler() { Serial2.IrqHandler(); }
+void SERCOM0_2_Handler() { Serial2.IrqHandler(); }
+void SERCOM0_3_Handler() { Serial2.IrqHandler(); }
+//End Serial2 configuration
+
+/**
+ * Converts a velocity in ERPM (velocity unit reported by the VESC, 7 ERPM per one RPM of the motor shaft)
+ * to miles per hour of the vehicle.  Uses the drive reduction and wheel circumference constants to perform the conversion.
+ * @param erpm The speed in ERPM, as a signed 32 bit integer
+ * @return The speed in MPH, as a double precision float
+ */
 double convertERPMtoMPH(int32_t erpm) {
     return (erpm * kFINAL_DRIVE_REDUCTION * kDRIVE_WHEEL_CIRCUMFERENCE * 60.0) / 4435200.0;
 }
 
-int convertMPHtoERPM(double mph) {
-    return (int) ((mph * 4435200.0) / (kFINAL_DRIVE_REDUCTION * kDRIVE_WHEEL_CIRCUMFERENCE * 60.0));
+/**
+ * Converts a velocity in MPH to ERPM.  See above function comment.
+ * @param mph The speed in MPH, as a double precision float
+ * @return The speed in ERPM, as a signed 32 bit integer
+ */
+int32_t convertMPHtoERPM(double mph) {
+    return (int32_t) ((mph * 4435200.0) / (kFINAL_DRIVE_REDUCTION * kDRIVE_WHEEL_CIRCUMFERENCE * 60.0));
 }
 
+/**
+ * Calculates a battery state given the voltage
+ * @param voltage The battery voltage
+ * @return The battery state (0 for ok, 1 for warn, 2 for bad)
+ */
+uint8_t calculateBatteryState(float voltage) {
+    if (voltage >= BATTERY_OK_THRESHOLD_VOLTS) return 0;
+    if (voltage >= BATTERY_WARN_THRESHOLD_VOLTS) return 1;
+    return 2;
+}
+
+//Converted form of the acceleration constant as a velocity change per millisecond
 int kVELOCITY_DV_ERPM = (int) (convertMPHtoERPM(kACCELERATION_MPH_PER_SECOND) / (1000.0 / kVESC_WRITE_RATE_MS));
 
 
 //Runtime values
 unsigned long ct = 0; //Current time
 
+//Values reported by the VESC
 float cVESC_inputVoltage = 0.0f;
 float cVESC_currentDrawAmps = 0.0f;
 float cVESC_ERPM = 0.0f;
 
+//Values reported by the HMI controller
 int cHMI_speedSetpointERPM = 0;
 
+//Values reported by the Safety controller
 bool cSC_estopActive = false;
 
+//Value used by the velocity profiler on this controller
 int c_activeSpeedTargetERPM = 0;
 
-uint8_t cHMI_readBuffer[kHMI_REQ_SIZE];
-uint8_t cHMI_writeBuffer[kHMI_REP_SIZE];
+//Faults
+uint32_t c_faultCode = 0;
+
+enum Faults {
+    ESTOP_FAULT,
+    VESC_COMM_FAULT,
+    TEST_FAULT
+};
+
+void registerFault(Faults fault) {
+    auto ordinal = (uint32_t) fault;
+    c_faultCode |= 1UL << ordinal;
+}
+
+void clearFault(Faults fault) {
+    auto ordinal = (uint32_t) fault;
+    c_faultCode &= ~(1UL << ordinal);
+}
+
+
+//Buffers for reading and writing data to the HMI over I2C
+uint8_t HMI_readBuffer[kHMI_REQ_SIZE];
+uint8_t HMI_writeBuffer[kHMI_REP_SIZE];
 
 //Runtime functions
 /**
@@ -103,37 +171,24 @@ void VESC_onValuesUpdated(mc_values *values) {
 }
 
 /**
- * Requests an update from the safety controller
+ * Requests an update from the safety controller over I2C
  */
 void SC_update() {
     Wire.requestFrom(kSC_WIRE_ADDR, 1); //This clears the Wire RX buffer for us so no need to worry about other data in the buffer.
     auto byteIn = Wire.read();
-    cSC_estopActive = byteIn != 0b00000000;
+    cSC_estopActive = byteIn != 0b00000000; //If anything but a 0 is returned from the safety controller, consider it an E-Stop
 }
 
 /**
  * Requests an update from the HMI controller, and sends the HMI controller current state information
  */
 void HMI_update() {
-    Wire.requestFrom(kHMI_WIRE_ADDR, kHMI_REQ_SIZE); //Request from the HMI
-    Wire.readBytes(cHMI_readBuffer, kHMI_REQ_SIZE); //Read the data from the HMI
-
     int32_t i = 0; //Buffer index, automatically incremented by buffer read and append calls
-
-    //Read data from buffer
-    //float32 speed_setpoint (MPH)
-    //TODAL - 32 bits (4 bytes)
-    //Note that there is only one float currently, but we use a buffer here to make it easy to add more data later
-    float speedSetpointMph = buffer_get_float32_auto(cHMI_readBuffer, &i);
-
-    //Set current values
-    cHMI_speedSetpointERPM = convertMPHtoERPM(speedSetpointMph);
 
     //Convert values for sending
     auto speedMph = (float) convertERPMtoMPH(cVESC_ERPM);
     auto speedTargetMph = (float) convertERPMtoMPH(c_activeSpeedTargetERPM);
-
-    i = 0; //Reset buffer index for writing
+    auto batteryState = calculateBatteryState(cVESC_inputVoltage);
 
     //Write data to out buffer
     //float32 battery_voltage
@@ -144,19 +199,34 @@ void HMI_update() {
     //int8 estop_state
     //int32 fault_code
     //TOTAL - 176 bits (22 bytes)
-    buffer_append_float32_auto(cHMI_writeBuffer, cVESC_inputVoltage, &i);
-    buffer_append_uint8(cHMI_writeBuffer, 0, &i); //TODO battery state
-    buffer_append_float32_auto(cHMI_writeBuffer, cVESC_currentDrawAmps, &i);
-    buffer_append_float32_auto(cHMI_writeBuffer, speedMph, &i);
-    buffer_append_float32_auto(cHMI_writeBuffer, speedTargetMph, &i);
-    buffer_append_uint8(cHMI_writeBuffer, cSC_estopActive, &i);
-    buffer_append_int32(cHMI_writeBuffer, 0, &i); //TODO fault code
+    buffer_append_float32_auto(HMI_writeBuffer, cVESC_inputVoltage, &i);
+    buffer_append_uint8(HMI_writeBuffer, batteryState, &i);
+    buffer_append_float32_auto(HMI_writeBuffer, cVESC_currentDrawAmps, &i);
+    buffer_append_float32_auto(HMI_writeBuffer, speedMph, &i);
+    buffer_append_float32_auto(HMI_writeBuffer, speedTargetMph, &i);
+    buffer_append_uint8(HMI_writeBuffer, cSC_estopActive, &i);
+    buffer_append_uint32(HMI_writeBuffer, 0, &i); //TODO fault code
 
 
-    //Write buffer out to wire
-    Wire.beginTransmission(kHMI_WIRE_ADDR);
-    Wire.write(cHMI_writeBuffer, kHMI_REP_SIZE);
-    Wire.endTransmission();
+    for (uint8_t j : HMI_writeBuffer) {
+        Serial2.write(j);
+    }
+}
+
+void HMI_processIncomingData() {
+    if (Serial2.available()) {
+        int32_t i = 0;
+        Serial2.readBytes(HMI_readBuffer, kHMI_REQ_SIZE);
+
+        //Read data from buffer
+        //float32 speed_setpoint (MPH)
+        //TOTAL - 32 bits (4 bytes)
+        //Note that there is only one float currently, but we use a buffer here to make it easy to add more data later
+        float speedSetpointMph = buffer_get_float32_auto(HMI_readBuffer, &i);
+
+        //Set current values
+        cHMI_speedSetpointERPM = convertMPHtoERPM(speedSetpointMph);
+    }
 }
 
 /**
@@ -196,19 +266,33 @@ void VESC_write() {
     bldc_interface_set_rpm(kOUTPUT_POLARITY * c_activeSpeedTargetERPM);
 }
 
+/**
+ * Updates the state of faults
+ */
+void updateFaults() {
+    if (cSC_estopActive) { //E-Stop fault
+        registerFault(Faults::ESTOP_FAULT);
+    } else {
+        clearFault(Faults::ESTOP_FAULT);
+    }
+}
+
 void setup() {
     //Serial is the UART connected to the USB port, Serial1 is the UART connected to the pins on the board.
     //Serial will be used for debug output, Serial1 will be used to communicate with the VESC
 
-    Serial.begin(115200); //Used for debugging over USB
+    //Serial.begin(115200); //Used for debugging over USB
     Serial1.begin(kVESC_BAUDRATE); //Used to communicate with the VESC
-    Wire.begin(); //Used to communicate with other controllers (safety and HMI)
+    Serial2.begin(kHMI_BAUDRATE); //Used to communicate with the HMI
+    Wire.begin(); //Used to communicate with other controllers (safety)
 
     bldc_interface_uart_init(VESC_serialWrite); //This binds the "serialWriteToVesc" function to the VESC library.
     bldc_interface_set_rx_value_func(VESC_onValuesUpdated); //Binds the "onVescData" function to the VESC library.
 
     pinMode(13, OUTPUT);
 
+    pinPeripheral(PIN_SERIAL2_RX, PIO_SERCOM_ALT);
+    pinPeripheral(PIN_SERIAL2_TX, PIO_SERCOM_ALT);
 }
 
 //Timing counters
@@ -250,21 +334,15 @@ void loop() {
         tLastSC_update = ct;
     }
 
-
+    HMI_processIncomingData();
     VESC_processIncomingData(); //Process any new serial data from the VESC
     bldc_interface_uart_run_timer(); //Updates the VESC library timer
+    updateFaults(); //Update faults
+
     //End phased loop code here
 
     //Phase the loop so it runs at the desired rate
     long elapsedMicros = micros() - start;
     long remainingTime = kLOOP_RATE_MICROS - elapsedMicros; //The time we need to delay for to hit the loop phase
     if (remainingTime > 0) delayMicroseconds(remainingTime);
-
-    if (elapsedMicros < 1000) {
-        digitalWrite(13, HIGH);
-    } else {
-        digitalWrite(13, LOW);
-    }
-
-    Serial.println(elapsedMicros); //TODO debug only, remove for release
 }
